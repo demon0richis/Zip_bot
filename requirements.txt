@@ -1,5 +1,5 @@
 pyrogram==2.0.106
 TgCrypto==1.2.5
-ffmpeg-python==0.2.0
 python-dotenv==1.0.1
 humanize==4.9.0
+motor==3.6.0
