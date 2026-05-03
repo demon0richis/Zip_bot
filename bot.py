@@ -40,7 +40,6 @@ FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 FFPROBE = shutil.which("ffprobe") or "ffprobe"
 
 ALLOWED_EXTS = {".mkv", ".mp4", ".mov", ".webm", ".avi", ".flv", ".m4v"}
-MAX_QUEUE_PER_CHAT = 1
 
 logging.basicConfig(
     level=logging.INFO,
@@ -110,7 +109,7 @@ def human_size(num: float) -> str:
 
 def fmt_time(seconds: float) -> str:
     if seconds is None or seconds <= 0 or seconds == float("inf"):
-        return "--:--:--"
+        return "00:00:00"
     return time.strftime("%H:%M:%S", time.gmtime(seconds))
 
 def progress_bar(percent: float, blocks: int = 12) -> str:
@@ -391,26 +390,35 @@ async def worker():
 
 async def recover_pending_jobs():
     if jobs_col is None:
+        log.info("Mongo disabled, skipping recovery")
         return
 
     try:
+        log.info("Recovering queued jobs...")
+
         await jobs_col.update_many(
             {"status": "processing"},
-            {"$set": {"status": "queued", "stage": "queued", "updated_at": time.time()}}
+            {
+                "$set": {
+                    "status": "queued",
+                    "stage": "queued",
+                    "updated_at": time.time()
+                }
+            }
         )
 
-        cursor = jobs_col.find(
-            {"status": "queued"},
-            sort=[("created_at", 1)]
-        )
+        cursor = jobs_col.find({"status": "queued"})
 
         async for doc in cursor:
             try:
-                chat_id = int(doc["chat_id"])
-                message_id = int(doc["message_id"])
-                msg = await app.get_messages(chat_id, message_id)
+                chat_id = int(doc.get("chat_id", 0))
+                message_id = int(doc.get("message_id", 0))
 
-                if not msg:
+                if not chat_id or not message_id:
+                    continue
+
+                msg = await app.get_messages(chat_id, message_id)
+                if msg is None:
                     await jobs_col.update_one(
                         {"_id": doc["_id"]},
                         {"$set": {"status": "failed", "stage": "failed", "error": "Message not found"}}
@@ -419,7 +427,7 @@ async def recover_pending_jobs():
 
                 file_name = doc.get("file_name") or f"file_{message_id}.mkv"
                 clean = clean_name(Path(file_name).stem)
-                job_dir = WORK_DIR / f"job_{chat_id}_{message_id}_{int(time.time())}"
+                job_dir = WORK_DIR / f"recover_{chat_id}_{message_id}"
                 job_dir.mkdir(parents=True, exist_ok=True)
 
                 ext = Path(file_name).suffix.lower() if Path(file_name).suffix else ".mkv"
@@ -437,10 +445,11 @@ async def recover_pending_jobs():
                     db_id=doc["_id"],
                 )
                 await queue.put(job)
-            except Exception:
-                continue
-    except Exception:
-        log.exception("Recovery failed")
+            except Exception as e:
+                log.error(f"Recovery item failed: {e}")
+
+    except Exception as e:
+        log.error(f"Recovery failed: {e}")
 
 # ======================
 # COMMANDS
@@ -450,7 +459,7 @@ async def recover_pending_jobs():
 async def start_cmd(_, message: Message):
     await save_user(message)
     await message.reply_text(
-        "👋 **Send me a video file** and I will convert it to MP4.\n\n"
+        "👋 Send me a video file and I will convert it to MP4.\n\n"
         "Supported: MKV, MP4, MOV, WEBM, AVI, FLV, M4V\n\n"
         "Commands:\n"
         "/start - start bot\n"
@@ -538,8 +547,8 @@ async def media_handler(_, message: Message):
 
 async def main():
     await app.start()
-    await recover_pending_jobs()
     asyncio.create_task(worker())
+    asyncio.create_task(recover_pending_jobs())
     log.info("Bot started")
     await idle()
     await app.stop()
