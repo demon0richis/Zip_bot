@@ -132,7 +132,7 @@ async def safe_edit(msg: Optional[Message], text: str):
         pass
 
 async def save_user(message: Message):
-    if not users_col or not message.from_user:
+    if users_col is None or not message.from_user:
         return
     try:
         await users_col.update_one(
@@ -151,7 +151,7 @@ async def save_user(message: Message):
         pass
 
 async def create_job_doc(job: Job):
-    if not jobs_col:
+    if jobs_col is None:
         return
     try:
         doc = {
@@ -170,7 +170,7 @@ async def create_job_doc(job: Job):
         pass
 
 async def update_job_doc(job: Job, **fields):
-    if not jobs_col or not job.db_id:
+    if jobs_col is None or job.db_id is None:
         return
     try:
         fields["updated_at"] = time.time()
@@ -390,7 +390,7 @@ async def worker():
             queue.task_done()
 
 async def recover_pending_jobs():
-    if not jobs_col:
+    if jobs_col is None:
         return
 
     try:
