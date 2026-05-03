@@ -6,22 +6,28 @@ import asyncio
 import logging
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 import humanize
 
-# =======================
+try:
+    from motor.motor_asyncio import AsyncIOMotorClient
+except Exception:
+    AsyncIOMotorClient = None
+
+# ======================
 # CONFIG
-# =======================
+# ======================
 
 load_dotenv()
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+MONGO_URI = os.getenv("MONGO_URI", "")
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise RuntimeError("Missing API_ID / API_HASH / BOT_TOKEN in .env")
@@ -49,9 +55,24 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-# =======================
+# ======================
+# MONGO
+# ======================
+
+mongo_client = None
+db = None
+users_col = None
+jobs_col = None
+
+if MONGO_URI and AsyncIOMotorClient:
+    mongo_client = AsyncIOMotorClient(MONGO_URI)
+    db = mongo_client["converter_bot"]
+    users_col = db["users"]
+    jobs_col = db["jobs"]
+
+# ======================
 # MODELS
-# =======================
+# ======================
 
 @dataclass
 class Job:
@@ -61,7 +82,9 @@ class Job:
     file_name: str
     input_path: Path
     output_path: Path
+    source_message: Optional[Message] = None
     status_msg: Optional[Message] = None
+    db_id: Optional[Any] = None
     started_at: float = field(default_factory=time.time)
     cancelled: bool = False
     stage: str = "queued"
@@ -70,9 +93,9 @@ queue: asyncio.Queue[Job] = asyncio.Queue()
 active_jobs: Dict[int, Job] = {}
 current_job: Optional[Job] = None
 
-# =======================
+# ======================
 # HELPERS
-# =======================
+# ======================
 
 def clean_name(name: str) -> str:
     name = re.sub(r'[\\/:*?"<>|]+', "_", name)
@@ -86,7 +109,7 @@ def human_size(num: float) -> str:
         return f"{num:.2f} B"
 
 def fmt_time(seconds: float) -> str:
-    if not seconds or seconds <= 0 or seconds == float("inf"):
+    if seconds is None or seconds <= 0 or seconds == float("inf"):
         return "--:--:--"
     return time.strftime("%H:%M:%S", time.gmtime(seconds))
 
@@ -100,28 +123,63 @@ def pct(current: float, total: float) -> float:
         return 0.0
     return max(0.0, min(100.0, (current * 100.0) / total))
 
-async def safe_edit(msg: Message, text: str):
+async def safe_edit(msg: Optional[Message], text: str):
+    if not msg:
+        return
     try:
         await msg.edit_text(text)
     except Exception:
         pass
 
-def status_text(stage: str, current: float, total: float, speed: float, elapsed: float) -> str:
-    percent = pct(current, total)
-    eta = (total - current) / speed if speed > 0 else 0
-    return (
-        f"⚡ **{stage}**\n\n"
-        f"[`{progress_bar(percent)}`] **{percent:.2f}%**\n\n"
-        f"📦 **Done:** `{human_size(current)}` / `{human_size(total)}`\n"
-        f"🚀 **Speed:** `{human_size(speed)}/s` \n"
-        f"⏳ **ETA:** `{fmt_time(eta)}`\n"
-        f"⌛ **Elapsed:** `{fmt_time(elapsed)}`"
-    )
+async def save_user(message: Message):
+    if not users_col or not message.from_user:
+        return
+    try:
+        await users_col.update_one(
+            {"user_id": message.from_user.id},
+            {
+                "$set": {
+                    "user_id": message.from_user.id,
+                    "username": message.from_user.username,
+                    "first_name": message.from_user.first_name,
+                    "last_seen": time.time(),
+                }
+            },
+            upsert=True
+        )
+    except Exception:
+        pass
 
-async def telegram_progress(current: int, total: int, msg: Message, started: float, stage: str):
-    elapsed = max(time.time() - started, 0.001)
-    speed = current / elapsed
-    await safe_edit(msg, status_text(stage, current, total, speed, elapsed))
+async def create_job_doc(job: Job):
+    if not jobs_col:
+        return
+    try:
+        doc = {
+            "chat_id": job.chat_id,
+            "user_id": job.user_id,
+            "message_id": job.message_id,
+            "file_name": job.file_name,
+            "status": "queued",
+            "stage": "queued",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+        res = await jobs_col.insert_one(doc)
+        job.db_id = res.inserted_id
+    except Exception:
+        pass
+
+async def update_job_doc(job: Job, **fields):
+    if not jobs_col or not job.db_id:
+        return
+    try:
+        fields["updated_at"] = time.time()
+        await jobs_col.update_one(
+            {"_id": job.db_id},
+            {"$set": fields}
+        )
+    except Exception:
+        pass
 
 async def ffprobe_duration(path: Path) -> float:
     proc = await asyncio.create_subprocess_exec(
@@ -139,25 +197,48 @@ async def ffprobe_duration(path: Path) -> float:
     except Exception:
         return 0.0
 
+async def progress_cb(current: int, total: int, msg: Message, started: float, stage: str, state: dict):
+    now = time.time()
+    if current < total and now - state.get("last", 0) < 2.0:
+        return
+    state["last"] = now
+
+    elapsed = max(now - started, 0.001)
+    speed = current / elapsed
+    percent = pct(current, total)
+    eta = (total - current) / speed if speed > 0 else 0
+
+    text = (
+        f"⚡ **{stage}**\n\n"
+        f"[`{progress_bar(percent)}`] **{percent:.2f}%**\n\n"
+        f"📦 **Done:** `{human_size(current)}` / `{human_size(total)}`\n"
+        f"🚀 **Speed:** `{human_size(speed)}/s`\n"
+        f"⏳ **ETA:** `{fmt_time(eta)}`\n"
+        f"⌛ **Elapsed:** `{fmt_time(elapsed)}`"
+    )
+    await safe_edit(msg, text)
+
 async def run_ffmpeg_convert(job: Job):
     duration = await ffprobe_duration(job.input_path)
     if duration <= 0:
         duration = 1.0
 
     job.stage = "converting"
+    await update_job_doc(job, status="processing", stage="converting")
     await safe_edit(job.status_msg, "🔄 **Converting...**\n\nPlease wait")
 
     cmd = [
         FFMPEG, "-hide_banner", "-y",
         "-i", str(job.input_path),
-        "-map", "0",
+        "-map", "0:v:0",
+        "-map", "0:a?",
+        "-sn",
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "23",
         "-c:a", "aac",
         "-b:a", "192k",
         "-movflags", "+faststart",
-        "-c:s", "copy",
         "-progress", "pipe:1",
         "-nostats",
         str(job.output_path)
@@ -171,7 +252,7 @@ async def run_ffmpeg_convert(job: Job):
 
     started = time.time()
     last_update = 0.0
-    out_time_ms = 0.0
+    out_time_us = 0.0
 
     while True:
         if job.cancelled:
@@ -189,16 +270,23 @@ async def run_ffmpeg_convert(job: Job):
 
         s = line.decode("utf-8", errors="ignore").strip()
 
-        if s.startswith("out_time_ms="):
+        if s.startswith("out_time_us="):
             try:
-                out_time_ms = float(s.split("=", 1)[1])
+                out_time_us = float(s.split("=", 1)[1])
+            except Exception:
+                pass
+        elif s.startswith("out_time_ms="):
+            try:
+                val = float(s.split("=", 1)[1])
+                out_time_us = val * 1000.0
             except Exception:
                 pass
 
         if s == "progress=continue" and (time.time() - last_update) >= 2.0:
             last_update = time.time()
-            current_sec = min(out_time_ms / 1_000_000.0, duration)
-            speed = current_sec / max(time.time() - started, 0.001)
+            current_sec = min(out_time_us / 1_000_000.0, duration)
+            elapsed = max(time.time() - started, 0.001)
+            speed = current_sec / elapsed
             eta = (duration - current_sec) / speed if speed > 0 else 0
             percent = pct(current_sec, duration)
 
@@ -208,7 +296,7 @@ async def run_ffmpeg_convert(job: Job):
                 f"🎞 **Processed:** `{fmt_time(current_sec)}` / `{fmt_time(duration)}`\n"
                 f"🚀 **Speed:** `{speed:.2f}x`\n"
                 f"⏳ **ETA:** `{fmt_time(eta)}`\n"
-                f"⌛ **Elapsed:** `{fmt_time(time.time() - started)}`"
+                f"⌛ **Elapsed:** `{fmt_time(elapsed)}`"
             )
             await safe_edit(job.status_msg, text)
 
@@ -219,18 +307,22 @@ async def run_ffmpeg_convert(job: Job):
             err = (await proc.stderr.read()).decode("utf-8", errors="ignore")
         except Exception:
             pass
-        raise RuntimeError(f"FFmpeg failed. {err[:700]}")
+        raise RuntimeError(f"FFmpeg failed. {err[:900]}")
 
 async def process_job(job: Job):
     try:
+        if not job.source_message:
+            raise RuntimeError("Source message missing")
+
         job.stage = "downloading"
+        await update_job_doc(job, status="processing", stage="downloading")
         await safe_edit(job.status_msg, "⬇️ **Downloading...**\n\nStarting download")
 
         await app.download_media(
-            message=job.message_id,
+            message=job.source_message,
             file_name=str(job.input_path),
-            progress=telegram_progress,
-            progress_args=(job.status_msg, job.started_at, "Downloading")
+            progress=progress_cb,
+            progress_args=(job.status_msg, job.started_at, "Downloading", {"last": 0.0})
         )
 
         if job.cancelled:
@@ -243,6 +335,7 @@ async def process_job(job: Job):
 
         job.stage = "uploading"
         upload_start = time.time()
+        await update_job_doc(job, status="processing", stage="uploading")
         await safe_edit(job.status_msg, "⬆️ **Uploading...**\n\nStarting upload")
 
         await app.send_document(
@@ -253,16 +346,19 @@ async def process_job(job: Job):
                 f"📄 `{job.output_path.name}`\n"
                 f"🎬 MKV → MP4"
             ),
-            progress=telegram_progress,
-            progress_args=(job.status_msg, upload_start, "Uploading")
+            progress=progress_cb,
+            progress_args=(job.status_msg, upload_start, "Uploading", {"last": 0.0})
         )
 
+        await update_job_doc(job, status="completed", stage="completed")
         await safe_edit(job.status_msg, "✅ **Done**")
 
     except asyncio.CancelledError:
+        await update_job_doc(job, status="cancelled", stage="cancelled")
         await safe_edit(job.status_msg, "🛑 **Cancelled**")
     except Exception as e:
         log.exception("Job failed")
+        await update_job_doc(job, status="failed", stage="failed", error=str(e)[:900])
         await safe_edit(job.status_msg, f"❌ **Error:** `{str(e)[:900]}`")
     finally:
         active_jobs.pop(job.chat_id, None)
@@ -293,23 +389,79 @@ async def worker():
             current_job = None
             queue.task_done()
 
-# =======================
+async def recover_pending_jobs():
+    if not jobs_col:
+        return
+
+    try:
+        await jobs_col.update_many(
+            {"status": "processing"},
+            {"$set": {"status": "queued", "stage": "queued", "updated_at": time.time()}}
+        )
+
+        cursor = jobs_col.find(
+            {"status": "queued"},
+            sort=[("created_at", 1)]
+        )
+
+        async for doc in cursor:
+            try:
+                chat_id = int(doc["chat_id"])
+                message_id = int(doc["message_id"])
+                msg = await app.get_messages(chat_id, message_id)
+
+                if not msg:
+                    await jobs_col.update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {"status": "failed", "stage": "failed", "error": "Message not found"}}
+                    )
+                    continue
+
+                file_name = doc.get("file_name") or f"file_{message_id}.mkv"
+                clean = clean_name(Path(file_name).stem)
+                job_dir = WORK_DIR / f"job_{chat_id}_{message_id}_{int(time.time())}"
+                job_dir.mkdir(parents=True, exist_ok=True)
+
+                ext = Path(file_name).suffix.lower() if Path(file_name).suffix else ".mkv"
+                if ext not in ALLOWED_EXTS:
+                    ext = ".mkv"
+
+                job = Job(
+                    chat_id=chat_id,
+                    user_id=int(doc.get("user_id", 0)),
+                    message_id=message_id,
+                    file_name=file_name,
+                    input_path=job_dir / f"{clean}{ext}",
+                    output_path=job_dir / f"{clean}.mp4",
+                    source_message=msg,
+                    db_id=doc["_id"],
+                )
+                await queue.put(job)
+            except Exception:
+                continue
+    except Exception:
+        log.exception("Recovery failed")
+
+# ======================
 # COMMANDS
-# =======================
+# ======================
 
 @app.on_message(filters.private & filters.command(["start", "help"]))
 async def start_cmd(_, message: Message):
+    await save_user(message)
     await message.reply_text(
         "👋 **Send me a video file** and I will convert it to MP4.\n\n"
         "Supported: MKV, MP4, MOV, WEBM, AVI, FLV, M4V\n\n"
         "Commands:\n"
         "/start - start bot\n"
         "/help - help\n"
+        "/status - current job\n"
         "/cancel - cancel current job"
     )
 
 @app.on_message(filters.private & filters.command("cancel"))
 async def cancel_cmd(_, message: Message):
+    await save_user(message)
     job = active_jobs.get(message.chat.id)
     if not job:
         await message.reply_text("No active job in this chat.")
@@ -317,14 +469,32 @@ async def cancel_cmd(_, message: Message):
     job.cancelled = True
     await message.reply_text("Stopping current job...")
 
+@app.on_message(filters.private & filters.command("status"))
+async def status_cmd(_, message: Message):
+    await save_user(message)
+    if current_job and current_job.chat_id == message.chat.id:
+        await message.reply_text(
+            f"**Active Job**\n\n"
+            f"Stage: `{current_job.stage}`\n"
+            f"File: `{current_job.file_name}`\n"
+            f"Queue size: `{queue.qsize()}`"
+        )
+    else:
+        await message.reply_text(f"No active job.\nQueue size: `{queue.qsize()}`")
+
 @app.on_message(filters.private & (filters.document | filters.video))
 async def media_handler(_, message: Message):
+    await save_user(message)
+
     media = message.document or message.video
     if not media:
         return
 
     file_name = getattr(media, "file_name", None) or f"video_{message.id}.mkv"
     ext = Path(file_name).suffix.lower()
+
+    if not ext:
+        ext = ".mkv"
 
     if ext not in ALLOWED_EXTS:
         await message.reply_text(
@@ -353,31 +523,22 @@ async def media_handler(_, message: Message):
         file_name=file_name,
         input_path=input_path,
         output_path=output_path,
-        status_msg=status
+        source_message=message,
+        status_msg=status,
     )
 
     active_jobs[message.chat.id] = job
+    await create_job_doc(job)
     await queue.put(job)
     await safe_edit(status, "🟨 **Added to queue**\n\nYour file will be processed soon.")
 
-@app.on_message(filters.private & filters.command("status"))
-async def status_cmd(_, message: Message):
-    if current_job and current_job.chat_id == message.chat.id:
-        await message.reply_text(
-            f"**Active Job**\n\n"
-            f"Stage: `{current_job.stage}`\n"
-            f"File: `{current_job.file_name}`\n"
-            f"Queue size: `{queue.qsize()}`"
-        )
-    else:
-        await message.reply_text(f"No active job.\nQueue size: `{queue.qsize()}`")
-
-# =======================
+# ======================
 # MAIN
-# =======================
+# ======================
 
 async def main():
     await app.start()
+    await recover_pending_jobs()
     asyncio.create_task(worker())
     log.info("Bot started")
     await idle()
